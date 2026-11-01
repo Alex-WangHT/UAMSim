@@ -1,167 +1,46 @@
-# UAMSim — MuJoCo 空中机械臂仿真器
+# UAMSim — 空中机械臂验证与对比框架
 
-面向多旋翼 + 机械臂（UAM, Unmanned Aerial Manipulator）的 MuJoCo 仿真与控制框架。采用**三线程实时架构**（仿真线程 + 多旋翼控制器线程 + 机械臂控制器线程），通过帧同步机制保证控制频率与物理帧严格对齐。
+UAMSim 负责 MuJoCo 模型、任务、扰动、通信接口、指标、实验结果、录像与回放。PX4 飞控算法和自定义 ROS 2 包是独立工程，框架不构建 PX4、不固定 ROS 节点、不依赖 ROS 2 安装。
 
----
+| 工程 | 职责 |
+| --- | --- |
+| UAMSim（本仓库） | 仿真、可重复评测、基线对比、状态记录与视频回放 |
+| UAMFlight（同级独立工程） | 外部飞控算法、PX4 构建配置、机型及 SITL 启动 |
+| UAMROS2（同级独立工程） | 自定义 ROS 发布/订阅、MAVLink 适配、机械臂与 CANopen 接口 |
 
-## 安装
+独立工程无需随本仓库安装；可以替换成你自己的实现。当前参考部署把三个工程放在同一台机器的 `ros2-learning` 容器中。
 
-```bash
-# 基础安装
-pip install -e .
-
-# 带开发依赖（lint / format / test）
-pip install -e ".[dev]"
-```
-
-### 系统要求
-
-- Python >= 3.10
-- numpy >= 1.24
-- mujoco >= 3.2
-- glfw >= 2.7
-- matplotlib >= 3.8
-
----
-
-## 30 秒快速开始
-
-```python
-import threading
-import numpy as np
-import UAMSim as ua
-
-
-class HoverController(ua.MultirotorController):
-    """自定义控制器：只需重写 controller() 方法。"""
-
-    def controller(self, feedback, target_pos, kp, hover):
-        err = target_pos - feedback.dronePosition
-        thrust = hover + kp * err[2]
-        return np.full(self._multirotor.n_rotors, thrust)
-
-
-# 1. 加载场景与机器人模型
-shutdown = threading.Event()
-env = ua.Environment("path/to/environment.xml")
-multirotor = ua.Multirotor("path/to/multirotor.xml")
-
-# 2. 启动仿真线程（自动组合、编译、创建帧同步通道）
-sim = ua.MujocoSimulation(shutdown, env, multirotor, use_viewer=True)
-sim.start()
-sim.wait_ready()          # 等待编译完成、通道就绪
-
-# 3. 构造并启动控制器（自动注册到帧同步通道）
-ctrl = HoverController(
-    sim.uam.multirotor, sim.drone_channel, shutdown,
-    target_pos=np.array([0.0, 0.0, 1.5]),
-    kp=4.0,
-    hover=sim.uam.hover_thrust(),
-)
-ctrl.start()
-
-# 4. 放行物理推进
-sim.start_physics()
-
-# 5. 运行一段时间后退出
-# shutdown.set()   # 设置退出标志，仿真与控制器自动停止
-```
-
-完整示例见 [`examples/demo.py`](examples/demo.py)。
-
----
-
-## 运行示例
+## 安装与基线对比
 
 ```bash
-# 纯多旋翼悬停演示（3 秒，GUI）
-python examples/demo.py
-
-# 完整集成演示：级联 PID + 机械臂 ±1 rad 摆动（9 秒）
-python examples/demo.py --full
-
-# 无头模式（不开 viewer，5× 加速）
-python examples/demo.py --full --headless
+python -m pip install -e '.[dev,sitl]'
+MUJOCO_GL=egl LIBGL_ALWAYS_SOFTWARE=1 python -m unittest discover -s tests -v
+python -m examples.benchmark --controllers pid geometric --tasks hover tracking arm_motion --seeds 0 1 2
 ```
 
----
+Python >= 3.10；无界面渲染需要 EGL/Mesa，视频导出需要 FFmpeg。`sitl` 是可选的 MAVLink 依赖，纯基线评测无需安装。PID/几何控制器作为验证用参考基线保留。
 
-## 包结构
+## 接入外部工程
 
-```text
-UAMSim/
-├── __init__.py                    # 公共 API 导出
-├── simulation/
-│   ├── environment.py             # Environment：场景组合器
-│   ├── multirotor.py              # Multirotor：多旋翼平台组件
-│   ├── manipulator.py             # Manipulator：机械臂组件
-│   ├── robot.py                   # Robot：已挂载机器人的视图句柄
-│   └── mujoco_simulation.py       # MujocoSimulation：仿真线程（三线程核心）
-├── controllers/
-│   ├── multirotor_controller.py   # MultirotorController：多旋翼控制器基类
-│   └── manipulator_controller.py  # ManipulatorController：机械臂控制器基类
-└── utils/
-    ├── actuators.py               # RotorActuator / ServoActuator 执行器缓冲
-    ├── frame_sync.py              # FrameMailbox / ControllerChannel 帧同步
-    ├── perception_bus.py          # SensorSnapshot / PerceptionSource / UDP 感知通道
-    ├── telemetry.py               # TelemetryBuffer 遥测缓存
-    └── telemetry_publisher.py     # TelemetryPublisher UDP 遥测发布
+实验配置属于你自己的集成工程。配置中的 `start`、`check`、`wait` 分别表示启动服务、执行验收和等待服务结束；命令使用参数数组，框架不拼接 shell 命令。
 
-examples/
-├── demo.py                        # 综合演示脚本（悬停 / 级联 PID + 机械臂）
-└── models/
-    ├── environment.xml            # 场景 MJCF（地板、灯光、障碍物）
-    ├── multirotor.xml             # 六旋翼平台 MJCF
-    └── Manipulator.xml            # 三自由度机械臂 MJCF
+```bash
+python -m examples.run_experiment --config /path/to/your/case.json --output logs/candidate-001
+python -m examples.run_experiment --compare logs/reference/summary.json logs/candidate-001/summary.json --output logs/comparison.json
 ```
 
----
+比较要求相同 `case_id`、不同 `label`，失败实验也保留。使用者负责保证同一 case 下模型、任务、种子和指标含义一致。配置规范见 [实验与接口契约](docs/EXPERIMENT_CONTRACT.md)。
 
-## 核心设计
+## 录像与回放
 
-### 三线程模型
-
-| 线程 | 职责 | 数据访问 |
-|------|------|----------|
-| **仿真线程** (`MujocoSimulation`) | 唯一访问 `mjData`，逐帧推进物理、发布传感快照、flush 执行器缓冲 | 读写 `mjData` |
-| **多旋翼控制器线程** | 接收快照 → 计算推力 → 写入 `RotorActuator` 缓冲 | 只读快照，不写 `mjData` |
-| **机械臂控制器线程** | 接收快照 → 计算关节目标角 → 写入 `ServoActuator` 缓冲 | 只读快照，不写 `mjData` |
-
-### 自定义控制器
-
-唯一需要重写的是 `controller()` 方法。构造参数通过 `**kwargs` 逐帧透传：
-
-```python
-class MyDroneCtrl(ua.MultirotorController):
-    def controller(self, feedback, target, kp):
-        err = target - feedback.dronePosition
-        return self.uam.hover_thrust() + kp * err[2]
-
-ctrl = MyDroneCtrl(sim.uam.multirotor, sim.drone_channel,
-                   target=[0, 0, 1.5], kp=2.0)
-ctrl.start()
+```bash
+python -m examples.px4_sitl_server --arm --sensors --duration 90 --record logs/run/recording
+# 另行启动你自己的飞控和 ROS 工程；完成后可独立导出视频
+MUJOCO_GL=egl LIBGL_ALWAYS_SOFTWARE=1 python -m examples.replay_recording logs/run/recording --output logs/run/flight.mp4
 ```
 
-运行期间可随时更新目标参数（下一帧生效）：
+生成 MP4 与带拖动、暂停、倍速的 HTML 播放页面。离线回放无需 PX4/ROS，须使用录制时相同的 MuJoCo 版本。详见 [录像机制](docs/RECORDING_AND_REPLAY.md)。
 
-```python
-ctrl.set_target(target=[0, 0, 2.0], kp=5.0)
-```
+本机完整用法放在工程同级 `../docs/UAMSim使用说明.md`。该同级文档及 UAMFlight、UAMROS2 不属于此 Git 仓库；本仓库 README 和接口文档足以接入其他外部工程。
 
-### 构型灵活
-
-- **纯多旋翼**：`MujocoSimulation(..., multirotor, None)`
-- **多旋翼 + 机械臂**：`MujocoSimulation(..., multirotor, manipulator)`
-- **自定义模型**：传入自己的 MJCF 路径即可
-
----
-
-## 详细文档
-
-使用指南、MJCF 命名约定、API 参考等详见 [`docs/DOCUMENT.md`](docs/DOCUMENT.md)。
-
----
-
-## 许可证
-
-MIT
+旧的三线程 API 保留兼容；新增验证链路采用单线程物理状态所有者，外部控制器经通信边界下发命令。历史 API 说明见 [DOCUMENT.md](docs/DOCUMENT.md)。

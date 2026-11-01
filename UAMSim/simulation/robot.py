@@ -8,6 +8,10 @@
 
 from __future__ import annotations
 
+import numpy as np
+
+from ..interfaces import JointState, Pose, RobotCommand, RobotState
+
 from .manipulator import Manipulator
 from .multirotor import Multirotor
 
@@ -52,5 +56,63 @@ class Robot:
             raise RuntimeError(
                 "Robot 尚未绑定编译产物：请经 Environment.attach_robot() 挂载编译后再调用"
             )
-        total_mass = float(self.model.body_mass.sum())
-        return total_mass * 9.81 / self.multirotor.n_rotors
+        total_mass = float(self.model.body_subtreemass[self.multirotor.body_id])
+        return total_mass * float(np.linalg.norm(self.model.opt.gravity)) / self.multirotor.n_rotors
+
+    def read_state(self) -> RobotState:
+        """Copy one coherent snapshot; call only from the physics owner thread.
+
+        Forward dynamics refreshes derived poses/velocities after mj_step.
+        This does not advance simulation time.
+        """
+        import mujoco
+
+        model, data = self.model, self.data
+        mujoco.mj_forward(model, data)
+        body = self.multirotor.body_id
+        velocity = np.zeros(6)
+        mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, body, velocity, 0)
+        rotation = data.xmat[body].reshape(3, 3)
+        joints = JointState((), np.empty(0), np.empty(0))
+        ee = None
+        if self.manipulator is not None:
+            arm = self.manipulator
+            joints = JointState(tuple(arm.joint_names), arm.get_joint_positions(), arm.get_joint_velocities())
+            position, matrix = arm.get_ee_pose()
+            quaternion = np.zeros(4)
+            mujoco.mju_mat2Quat(quaternion, matrix.reshape(9))
+            ee = Pose(position, quaternion)
+        return RobotState(
+            float(data.time), float(model.opt.timestep), Pose(data.xpos[body], data.xquat[body]),
+            velocity[3:], rotation.T @ velocity[:3], joints, ee,
+        )
+
+    def apply_command(self, command: RobotCommand) -> None:
+        """Validate the complete command before writing any actuator.
+
+        Unspecified groups hold their previous command. Reject out-of-range
+        commands instead of silently clipping. Only the physics owner may call.
+        Joint names must match the model; ordering may differ.
+        """
+        if not isinstance(command, RobotCommand):
+            raise TypeError("expected RobotCommand")
+        ids, values = [], []
+        if command.rotors is not None:
+            if len(command.rotors.thrust) != self.multirotor.n_rotors:
+                raise ValueError("rotor count does not match robot")
+            ids.extend(self.multirotor.rotors[n] for n in self.multirotor.rotor_names)
+            values.extend(command.rotors.thrust)
+        if command.joints is not None:
+            arm = self.manipulator
+            if arm is None or set(command.joints.names) != set(arm.joint_names):
+                raise ValueError("joint names do not match robot")
+            ids.extend(arm.servos[n] for n in command.joints.names)
+            values.extend(command.joints.position)
+        if not ids:
+            return
+        values = np.asarray(values)
+        limits = self.model.actuator_ctrlrange[ids]
+        limited = self.model.actuator_ctrllimited[ids].astype(bool)
+        if not np.isfinite(values).all() or np.any(limited & ((values < limits[:, 0]) | (values > limits[:, 1]))):
+            raise ValueError("actuator command is non-finite or outside model limits")
+        self.data.ctrl[ids] = values

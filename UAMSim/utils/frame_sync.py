@@ -100,6 +100,8 @@ class ControllerChannel:
 
     def attach(self, actuators: list) -> None:
         """控制器注册执行器缓冲列表（线程外调用，物理启动前完成）。"""
+        if self.has_subscriber:
+            raise RuntimeError("ControllerChannel already has a subscriber")
         self._actuators = list(actuators)
         self.has_subscriber = True
 

@@ -55,6 +55,11 @@ quaternionToEuler = quaternion_to_euler
 # ---------------------------------------------------------------------------
 
 # simulation
+from .interfaces import JointPositionCommand, JointState, Pose, RobotCommand, RobotState, RotorCommand  # noqa: E402
+from .interfaces import ControlTarget  # noqa: E402
+from .simulation.controlled_simulation import ControlledSimulation  # noqa: E402
+from .controllers.cascaded_pid import CascadedPID, Controller, PIDGains  # noqa: E402
+from .controllers.geometric import GeometricController  # noqa: E402
 from .simulation.environment import Environment  # noqa: E402
 from .simulation.multirotor import Multirotor  # noqa: E402
 from .simulation.manipulator import Manipulator  # noqa: E402
@@ -80,6 +85,18 @@ from .utils.telemetry_publisher import TelemetryPublisher  # noqa: E402
 
 __version__ = "0.1.0"
 __all__ = [
+    "ControlTarget",
+    "ControlledSimulation",
+    "Controller",
+    "CascadedPID",
+    "GeometricController",
+    "PIDGains",
+    "Pose",
+    "JointState",
+    "RobotState",
+    "RotorCommand",
+    "JointPositionCommand",
+    "RobotCommand",
     # simulation
     "Environment",
     "Multirotor",

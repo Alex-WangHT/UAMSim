@@ -77,13 +77,19 @@ class MujocoSimulation(threading.Thread):
         self._telemetry_divisor = 1                       # 抽稀因子（按物理帧计）
         self._frame_index = 0
         self._ready = threading.Event()                  # 编译完成、通道已暴露
+        self._startup_done = threading.Event()
+        self.error: Exception | None = None
         self._gate = threading.Event()                   # start_physics() 放行
 
     # ---------- 对外握手 ----------
 
     def wait_ready(self, timeout: float | None = None) -> bool:
-        """等待场景编译完成（通道已暴露、物理仍停放），返回是否就绪。"""
-        return self._ready.wait(timeout)
+        """等待启动完成；超时返回 False，启动失败抛出带原始原因的 RuntimeError。"""
+        if not self._startup_done.wait(timeout):
+            return False
+        if self.error is not None:
+            raise RuntimeError("Simulation startup failed") from self.error
+        return self._ready.is_set()
 
     def start_physics(self) -> None:
         """放行物理推进（控制器线程应在此之前构造并 start）。"""
@@ -120,28 +126,28 @@ class MujocoSimulation(threading.Thread):
     # ---------- 线程入口 ----------
 
     def run(self) -> None:
-        if mujoco is None:
-            print("[MujocoSimulation] mujoco 未安装，进入 clock-only 空转模式。")
-            self._ready.set()
-            self._run_without_mujoco()
-            return
-
-        self._build()
-        self._print_diagnostics()
-        self._start_telemetry_channel()
-        self._start_perception_channel()
-        self._ready.set()
-
-        # 物理停放：等待外部接线（控制器构造 + start）完成后放行
-        while not self._gate.is_set() and not self._shutdown_event.is_set():
-            self._gate.wait(0.05)
-
         try:
+            if mujoco is None:
+                raise RuntimeError("MuJoCo is required for physics simulation")
+            self._build()
+            self._print_diagnostics()
+            self._start_telemetry_channel()
+            self._start_perception_channel()
+            self._ready.set()
+            self._startup_done.set()
+            while not self._gate.is_set() and not self._shutdown_event.is_set():
+                self._gate.wait(0.05)
+            if self._shutdown_event.is_set():
+                return
             if self._use_viewer:
                 self._launch_viewer()
             else:
                 self._run_headless()
+        except Exception as exc:
+            self.error = exc
+            self._shutdown_event.set()
         finally:
+            self._startup_done.set()
             # 关闭通道：控制器线程的 wait_snapshot 收到 None 后自行退出
             if self.drone_channel is not None:
                 self.drone_channel.close()
@@ -267,7 +273,8 @@ class MujocoSimulation(threading.Thread):
         drone_ch = self.drone_channel
         if drone_ch is not None and drone_ch.has_subscriber:
             drone_ch.mailbox.publish(sensor)
-            drone_ch.mailbox.wait_done(self._shutdown_event)
+            if not drone_ch.mailbox.wait_done(self._shutdown_event):
+                return
             drone_ch.flush()
         else:
             thrust = (
@@ -282,7 +289,8 @@ class MujocoSimulation(threading.Thread):
         if arm_ch is not None and arm_ch.has_subscriber:
             arm_snap = self.uam.manipulator.get_state()
             arm_ch.mailbox.publish(arm_snap)
-            arm_ch.mailbox.wait_done(self._shutdown_event)
+            if not arm_ch.mailbox.wait_done(self._shutdown_event):
+                return
             arm_ch.flush()
 
         if self._telemetry_publisher is not None:
@@ -321,20 +329,6 @@ class MujocoSimulation(threading.Thread):
         deadline = loop_start + float(self.env.model.opt.timestep) / self._rtf
         while time.perf_counter() < deadline:
             pass
-
-    # ---------- 降级模式（无 mujoco） ----------
-
-    def _run_without_mujoco(self) -> None:
-        timestamp = 0.0
-        timestep = 0.001
-        position = np.zeros(3)
-        euler = np.zeros(3)
-        while not self._shutdown_event.is_set():
-            sensor = SensorSnapshot(timestamp=timestamp, timestep=timestep)
-            if self._telemetry_buffer is not None:
-                self._telemetry_buffer.append(timestamp, position, euler)
-            time.sleep(timestep)
-            timestamp += timestep
 
     # ---------- 诊断 ----------
 

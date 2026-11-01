@@ -87,9 +87,8 @@ class ManipulatorController(threading.Thread):
         # ---- 实时目标参数（线程安全，由 set_target 更新） ----
         self._target: dict = {}
         self._target_lock = threading.Lock()
-        self._channel = channel
-        self._shutdown_event = shutdown_event if shutdown_event is not None else threading.Event()
-        self.params = dict(controller_params)
+        self.last_error: Exception | None = None
+        self.error_count = 0
 
         # ---- 自动注册控制输出：每个关节一个舵机缓冲，注册到通道 ----
         model, data = manipulator.model, manipulator.data
@@ -180,17 +179,19 @@ class ManipulatorController(threading.Thread):
                 q = np.asarray(
                     self.controller(snapshot, **frame_params), dtype=float
                 ).reshape(-1)
-                q = np.asarray(
-                    self.controller(snapshot, **self.params), dtype=float
-                ).reshape(-1)
                 if q.size != n_joints:
                     raise ValueError(
                         f"controller() 应返回 {n_joints} 个目标角，收到 {q.size} 个"
                     )
+                if not np.all(np.isfinite(q)):
+                    raise ValueError("controller() returned non-finite joint targets")
                 for servo, value in zip(self.servos, q):
                     servo.set_target(float(value))
                 last_error = None
+                self.last_error = None
             except Exception as exc:  # noqa: BLE001 - 用户控制律故障不应击落控制环
+                self.last_error = exc
+                self.error_count += 1
                 message = f"{type(exc).__name__}: {exc}"
                 if message != last_error:
                     print(f"[ManipulatorController] controller() 异常（保持上一条指令）: {message}")
